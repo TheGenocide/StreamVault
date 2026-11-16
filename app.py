@@ -812,7 +812,11 @@ class MainWindow(QMainWindow):
         bar.setValue(0)
         bar.setFormat("0%")
         bar.setFixedHeight(16)
-        self.table.setCellWidget(row, 3, bar)
+        bar_wrapper = QWidget()
+        bar_layout = QHBoxLayout(bar_wrapper)
+        bar_layout.setContentsMargins(8, 0, 8, 0)
+        bar_layout.addWidget(bar)
+        self.table.setCellWidget(row, 3, bar_wrapper)
         title_link = QLabel()
         title_link.setTextFormat(Qt.TextFormat.RichText)
         title_link.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse |
@@ -830,7 +834,7 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= len(self.items):
             return
         item = self.items[row]
-        self.table.item(row, 0).setText(item.title)
+        self.table.item(row, 0).setText("")
         self.table.item(row, 0).setToolTip(item.url)
         link = self.table.cellWidget(row, 0)
         link.setText(f'<a href="{escape(item.url, quote=True)}" style="color:{PRIMARY};text-decoration:underline">{escape(item.title)}</a>')
@@ -995,11 +999,15 @@ class MainWindow(QMainWindow):
         self.items[row].status = status
         self.refresh_row(row)
 
+    def _progress_bar(self, row: int) -> QProgressBar:
+        return self.table.cellWidget(row, 3).findChild(QProgressBar)
+
     def set_item_progress(self, row: int, pct: int, message: str):
-        self.table.cellWidget(row, 3).setValue(pct)
+        bar = self._progress_bar(row)
+        bar.setValue(pct)
         self.items[row].status = "กำลังดาวน์โหลด" if pct < 100 else "เสร็จสิ้น"
         self.table.item(row, 2).setText(self.items[row].status)
-        self.table.cellWidget(row, 3).setToolTip(message)
+        bar.setToolTip(message)
 
     def on_file_complete(self, row: int, path: str):
         self.items[row].local_path = path
@@ -1016,7 +1024,7 @@ class MainWindow(QMainWindow):
             self.items[row].status = "สำเร็จ (บันทึก log ไม่ได้)"
             QMessageBox.warning(self, "บันทึกประวัติไม่สำเร็จ", f"ไฟล์ดาวน์โหลดสำเร็จแล้ว แต่บันทึกประวัติไม่ได้\n{exc}\nเปลี่ยนที่เก็บ log ได้ในตั้งค่าดาวน์โหลด")
         self.refresh_row(row)
-        self.table.cellWidget(row, 3).setValue(100)
+        self._progress_bar(row).setValue(100)
 
     def on_file_warning(self, row: int, message: str):
         log_failed = "บันทึก log ไม่ได้" in self.items[row].status
@@ -1029,7 +1037,7 @@ class MainWindow(QMainWindow):
         self.items[row].status = "ล้มเหลว"
         self.refresh_row(row)
         self.table.item(row, 2).setToolTip(error)
-        self.table.cellWidget(row, 3).setToolTip(error)
+        self._progress_bar(row).setToolTip(error)
         self.footer.setText("มีรายการโหลดไม่สำเร็จ • วางเมาส์บนสถานะเพื่อดูสาเหตุ")
 
     def stop_download(self):
