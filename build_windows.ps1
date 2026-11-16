@@ -9,7 +9,7 @@ function Fail($Message) {
 }
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host " StreamVault 1.2 - Build Windows EXE " -ForegroundColor Cyan
+Write-Host " StreamVault 1.3.0 - Build Windows EXE " -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
 $pythonCmd = $null
@@ -71,21 +71,8 @@ if (-not (Test-Path tools\deno.exe)) {
 } else { Write-Host '[4/5] Deno found.' }
 
 Write-Host '[5/5] Building with PyInstaller...'
-$pyiArgs = @(
-    '--noconfirm', '--clean', '--windowed',
-    '--name', 'StreamVault',
-    '--icon', 'assets\streamvault.ico',
-    '--collect-all', 'yt_dlp_ejs',
-    '--collect-submodules', 'yt_dlp',
-    '--add-binary', 'tools\ffmpeg.exe;tools',
-    '--add-binary', 'tools\ffprobe.exe;tools',
-    '--add-binary', 'tools\deno.exe;tools',
-    '--add-data', 'assets\streamvault.ico;assets'
-)
-if (Test-Path tools\ffplay.exe) { $pyiArgs += @('--add-binary', 'tools\ffplay.exe;tools') }
-if ($Onedir) { $pyiArgs += '--onedir' }
-else { $pyiArgs += '--onefile' }
-$pyiArgs += 'app.py'
+$pyiArgs = @('--noconfirm', '--clean', 'StreamVault.spec')
+if ($Onedir) { $pyiArgs += @('--', '--onedir') }
 & $python -m PyInstaller @pyiArgs
 if ($LASTEXITCODE -ne 0) { Fail 'PyInstaller build failed. See output for details.' }
 

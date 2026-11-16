@@ -9,11 +9,13 @@ import shutil
 import sys
 import tempfile
 import urllib.request
+from html import escape
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import Qt, QThread, Signal, QUrl, QSize, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QUrl, QSize, QTimer, QSettings
 from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QLinearGradient
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -24,9 +26,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 import yt_dlp
 from music_tags import music_metadata, thumbnail_as_jpeg, write_mp3_tags, save_cover_jpg
+from download_history import DownloadHistory, video_id
 
 APP_NAME = "StreamVault"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 SAMPLE_SECONDS = 30
 DEFAULT_DIR = Path.home() / "Downloads" / APP_NAME
 BG = "#0B111C"
@@ -40,6 +43,11 @@ GREEN = "#33D5AE"
 
 def application_root() -> Path:
     return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+
+
+def default_history_path() -> Path:
+    root = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    return root / "download_history.jsonl"
 
 
 def bundled_binary(name: str) -> str | None:
@@ -68,6 +76,8 @@ def ydl_common() -> dict:
         "fragment_retries": 5,
         "skip_unavailable_fragments": True,
         "windowsfilenames": True,
+        # Format probes must also work when the application folder is read-only.
+        "paths": {"temp": tempfile.gettempdir()},
     }
     deno = bundled_binary("deno")
     if deno:
@@ -261,13 +271,14 @@ class DownloadWorker(QThread):
                     "overwrites": False,
                     "continuedl": True,
                 })
-                if self.output_format == "MP3":
+                if self.output_format in ("MP3", "FLAC", "WAV"):
                     opts["format"] = "bestaudio/best"
                     opts["postprocessors"] = [{
                         "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": self.quality.replace(" kbps", ""),
+                        "preferredcodec": self.output_format.lower(),
                     }]
+                    if self.output_format == "MP3":
+                        opts["postprocessors"][0]["preferredquality"] = self.quality.replace(" kbps", "")
                 else:
                     max_height = {"สูงสุดที่มี": 99999, "4K · 2160p": 2160,
                                   "2K · 1440p": 1440, "Full HD · 1080p": 1080,
@@ -281,7 +292,7 @@ class DownloadWorker(QThread):
                     opts["postprocessors"] = [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}]
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     result = ydl.extract_info(item.url, download=True)
-                output = self.folder / (base + (".mp3" if self.output_format == "MP3" else ".mp4"))
+                output = self.folder / (base + "." + self.output_format.lower())
                 if not output.is_file():
                     for candidate in reversed(found_path):
                         if Path(candidate).is_file() and Path(candidate).suffix.lower() == output.suffix:
@@ -346,19 +357,15 @@ class PreviewWorker(QThread):
             self.failure.emit("ไม่พบ FFmpeg กรุณาใช้ชุดโปรแกรมที่มี tools/ffmpeg.exe")
             return
         try:
-            opts = {**ydl_common(), "format": "bestaudio/best", "skip_download": True}
+            opts = {**ydl_common(), "format": "bestaudio/best", "skip_download": True,
+                    "check_formats": True}
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(self.url, download=False)
-                formats = info.get("formats") or []
-                playable = [f for f in formats if f.get("acodec") not in (None, "none") and
-                            f.get("vcodec") == "none" and f.get("url")]
-                playable.sort(key=lambda f: (f.get("abr") or 0, f.get("asr") or 0))
-                stream = (playable[-1] if playable else info)
-                stream_url = stream.get("url")
+                # Keep yt-dlp's checked selection; raw formats can include rejected streams.
+                stream_url = info.get("url")
                 if not stream_url:
                     raise ValueError("ไม่พบสตรีมเสียงสำหรับตัวอย่าง")
                 headers = dict(info.get("http_headers") or {})
-                headers.update(stream.get("http_headers") or {})
             args = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
                     "-nostdin", "-rw_timeout", "25000000"]
             if headers:
@@ -407,6 +414,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         setup_binary_path()
         self.items: list[QueueItem] = []
+        self.history = None
         self.metadata_worker: MetadataWorker | None = None
         self.download_worker: DownloadWorker | None = None
         self.preview_worker: PreviewWorker | None = None
@@ -418,7 +426,7 @@ class MainWindow(QMainWindow):
         self.player.setAudioOutput(self.audio)
         self.audio.setVolume(0.75)
         self.is_seeking = False
-        self.setWindowTitle(f"{APP_NAME} — YouTube MP3 / MP4")
+        self.setWindowTitle(f"{APP_NAME} v{VERSION} — YouTube MP3 / MP4 / FLAC / WAV")
         iconfile = application_root() / "assets" / "streamvault.ico"
         if iconfile.is_file():
             self.setWindowIcon(QIcon(str(iconfile)))
@@ -427,6 +435,8 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self._make_ui()
         self._wire_player()
+        self._restore_settings()
+        self._load_history()
         self.update_counters()
         self._check_tools()
 
@@ -479,10 +489,10 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         identity = QVBoxLayout()
         identity.setSpacing(1)
-        brand = QLabel("●  StreamVault")
+        brand = QLabel(f"●  {APP_NAME} v{VERSION}")
         brand.setStyleSheet("font-size:22px; font-weight:750; color:#F1F5FF;")
         identity.addWidget(brand)
-        identity.addWidget(label("YouTube เป็น MP3 หรือ MP4", size=11, muted=True))
+        identity.addWidget(label("YouTube เป็น MP3, MP4, FLAC หรือ WAV", size=11, muted=True))
         header.addLayout(identity)
         header.addStretch(1)
         self.btn_open = QPushButton("เปิดโฟลเดอร์")
@@ -531,14 +541,15 @@ class MainWindow(QMainWindow):
         self.btn_remove.clicked.connect(self.remove_selected)
         queue_head.addWidget(self.btn_remove)
         queue_layout.addLayout(queue_head)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["ชื่อวิดีโอ", "ความยาว", "สถานะ", "ดาวน์โหลด"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["ชื่อวิดีโอ ↗ YouTube", "ความยาว", "สถานะ", "ดาวน์โหลด", "ประวัติ"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col in (1, 2, 3):
+        for col in (1, 2, 3, 4):
             self.table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(1, 86)
         self.table.setColumnWidth(2, 138)
         self.table.setColumnWidth(3, 138)
+        self.table.setColumnWidth(4, 116)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -562,7 +573,8 @@ class MainWindow(QMainWindow):
         form_row.setSpacing(10)
         form_row.addWidget(label("ชนิดไฟล์", size=11, muted=True))
         self.format = QComboBox()
-        self.format.addItems(["MP3", "MP4"])
+        self.format.addItems(["MP3", "MP4", "FLAC", "WAV"])
+        self.format.setToolTip("FLAC/WAV เป็นไฟล์ lossless แต่ไม่คืนรายละเอียดที่สตรีม YouTube บีบอัดไปแล้ว")
         self.format.setMinimumWidth(106)
         self.format.currentTextChanged.connect(self.update_qualities)
         form_row.addWidget(self.format, 1)
@@ -590,6 +602,20 @@ class MainWindow(QMainWindow):
         extras.addWidget(self.chk_cover)
         extras.addStretch(1)
         settings_layout.addLayout(extras)
+        history_row = QHBoxLayout()
+        history_row.addWidget(label("ไฟล์ประวัติ", size=11, muted=True))
+        self.history_path = QLineEdit(str(default_history_path()))
+        self.history_path.setReadOnly(True)
+        self.history_path.setToolTip("บันทึกเฉพาะรายการที่ดาวน์โหลดสำเร็จ")
+        history_row.addWidget(self.history_path, 1)
+        self.btn_history_path = QPushButton("เปลี่ยนที่เก็บ log")
+        self.btn_history_path.clicked.connect(self.pick_history_path)
+        history_row.addWidget(self.btn_history_path)
+        self.btn_clear_history = QPushButton("ล้างประวัติ")
+        self.btn_clear_history.setObjectName("quiet")
+        self.btn_clear_history.clicked.connect(self.clear_history)
+        history_row.addWidget(self.btn_clear_history)
+        settings_layout.addLayout(history_row)
         action_row = QHBoxLayout()
         action_row.addStretch(1)
         self.btn_stop = QPushButton("หยุดดาวน์โหลด")
@@ -661,7 +687,7 @@ class MainWindow(QMainWindow):
         self.time_total = label("00:00", size=11, muted=True)
         player_row.addWidget(self.time_total)
         player_row.addWidget(label("เสียง", size=11, muted=True))
-        volume = QSlider(Qt.Orientation.Horizontal)
+        volume = self.volume = QSlider(Qt.Orientation.Horizontal)
         volume.setRange(0, 100)
         volume.setValue(75)
         volume.setMaximumWidth(105)
@@ -688,6 +714,8 @@ class MainWindow(QMainWindow):
         self.btn_preview.setEnabled(selected and not preview_busy)
         self.btn_local.setEnabled(bool(local_ready))
         self.btn_download.setEnabled(bool(self.items) and not busy)
+        self.btn_history_path.setEnabled(not busy)
+        self.btn_clear_history.setEnabled(not busy and self.history is not None)
 
     def _metadata_finished(self):
         self._sync_actions()
@@ -729,10 +757,14 @@ class MainWindow(QMainWindow):
         self.quality.clear()
         if self.format.currentText() == "MP3":
             choices = ["320 kbps", "256 kbps", "192 kbps", "128 kbps"]
-        else:
+        elif self.format.currentText() == "MP4":
             choices = ["สูงสุดที่มี", "4K · 2160p", "2K · 1440p", "Full HD · 1080p", "HD · 720p", "480p", "360p"]
+        else:
+            choices = ["Lossless"]
         self.quality.addItems(choices)
         self.quality.setCurrentText(prior if prior in choices else choices[0])
+        self.quality.setEnabled(self.format.currentText() in ("MP3", "MP4") and not (
+            self.download_worker and self.download_worker.isRunning()))
         self.chk_tags.setEnabled(self.format.currentText() == "MP3" and not (
             self.download_worker and self.download_worker.isRunning()))
 
@@ -781,6 +813,18 @@ class MainWindow(QMainWindow):
         bar.setFormat("0%")
         bar.setFixedHeight(16)
         self.table.setCellWidget(row, 3, bar)
+        title_link = QLabel()
+        title_link.setTextFormat(Qt.TextFormat.RichText)
+        title_link.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse |
+                                           Qt.TextInteractionFlag.LinksAccessibleByKeyboard)
+        title_link.setOpenExternalLinks(True)
+        title_link.setContentsMargins(7, 0, 7, 0)
+        title_link.setMinimumWidth(0)
+        from PySide6.QtWidgets import QSizePolicy
+        title_link.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.table.setCellWidget(row, 0, title_link)
+        self.table.setItem(row, 4, QTableWidgetItem())
+        self.refresh_row(row)
 
     def refresh_row(self, row: int):
         if row < 0 or row >= len(self.items):
@@ -788,8 +832,17 @@ class MainWindow(QMainWindow):
         item = self.items[row]
         self.table.item(row, 0).setText(item.title)
         self.table.item(row, 0).setToolTip(item.url)
+        link = self.table.cellWidget(row, 0)
+        link.setText(f'<a href="{escape(item.url, quote=True)}" style="color:{PRIMARY};text-decoration:underline">{escape(item.title)}</a>')
+        link.setToolTip(f"เปิดใน YouTube: {item.url}")
         self.table.item(row, 1).setText(seconds_label(item.duration))
         self.table.item(row, 2).setText(item.status)
+        previous = self.history.latest(item.vid or video_id(item.url)) if self.history else None
+        history_cell = self.table.item(row, 4)
+        history_cell.setText("เคยโหลดแล้ว" if previous else ("ยังไม่เคยโหลด" if self.history else "อ่านประวัติไม่ได้"))
+        history_cell.setForeground(QColor("#FFD47A" if previous else MUTED))
+        history_cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        history_cell.setToolTip((f"โหลดสำเร็จเมื่อ {previous.get('downloaded_at', '')}\n{previous.get('path', '')}\nสามารถดาวน์โหลดซ้ำได้") if previous else "")
         if self.table.currentRow() == row:
             self.show_selected()
         self.update_counters()
@@ -911,6 +964,13 @@ class MainWindow(QMainWindow):
         if not pending:
             QMessageBox.information(self, "เสร็จแล้ว", "ทุกรายการมีไฟล์ที่โหลดแล้ว")
             return
+        duplicates = [item for _, item in pending
+                      if self.history and self.history.latest(item.vid or video_id(item.url))]
+        if duplicates and QMessageBox.question(
+                self, "พบรายการที่เคยดาวน์โหลด", f"มี {len(duplicates)} รายการที่เคยดาวน์โหลดสำเร็จแล้ว\nต้องการดาวน์โหลดซ้ำหรือไม่?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
         self.download_worker = DownloadWorker(
             pending, str(directory), self.format.currentText(), self.quality.currentText(),
             add_music_tags=self.chk_tags.isChecked(), save_cover=self.chk_cover.isChecked(), parent=self)
@@ -944,11 +1004,23 @@ class MainWindow(QMainWindow):
     def on_file_complete(self, row: int, path: str):
         self.items[row].local_path = path
         self.items[row].status = "สำเร็จ"
+        item = self.items[row]
+        try:
+            if self.history is None:
+                raise OSError("ไม่สามารถอ่านไฟล์ประวัติ กรุณาเลือกที่เก็บ log ใหม่")
+            self.history.append({"video_id": item.vid or video_id(item.url), "url": item.url,
+                                 "title": item.title, "path": path,
+                                 "format": self.format.currentText(), "quality": self.quality.currentText(),
+                                 "downloaded_at": datetime.now(timezone.utc).isoformat()})
+        except (OSError, ValueError) as exc:
+            self.items[row].status = "สำเร็จ (บันทึก log ไม่ได้)"
+            QMessageBox.warning(self, "บันทึกประวัติไม่สำเร็จ", f"ไฟล์ดาวน์โหลดสำเร็จแล้ว แต่บันทึกประวัติไม่ได้\n{exc}\nเปลี่ยนที่เก็บ log ได้ในตั้งค่าดาวน์โหลด")
         self.refresh_row(row)
         self.table.cellWidget(row, 3).setValue(100)
 
     def on_file_warning(self, row: int, message: str):
-        self.items[row].status = "สำเร็จ (ข้อมูลไม่ครบ)"
+        log_failed = "บันทึก log ไม่ได้" in self.items[row].status
+        self.items[row].status = "สำเร็จ (บันทึก log ไม่ได้ / ข้อมูลไม่ครบ)" if log_failed else "สำเร็จ (ข้อมูลไม่ครบ)"
         self.refresh_row(row)
         self.table.item(row, 2).setToolTip(message)
         self.footer.setText("โหลดไฟล์แล้ว แต่บางข้อมูลไม่ครบ • ดูรายละเอียดที่สถานะ")
@@ -1070,6 +1142,71 @@ class MainWindow(QMainWindow):
             self.add_links()
             event.acceptProposedAction()
 
+    def _restore_settings(self):
+        settings = QSettings(APP_NAME, APP_NAME)
+        self.format.setCurrentText(settings.value("format", "MP3", type=str))
+        self.quality.setCurrentText(settings.value("quality", self.quality.currentText(), type=str))
+        self.folder.setText(settings.value("folder", str(DEFAULT_DIR), type=str))
+        self.chk_tags.setChecked(settings.value("tags", True, type=bool))
+        self.chk_cover.setChecked(settings.value("cover", True, type=bool))
+        self.volume.setValue(max(0, min(100, settings.value("volume", 75, type=int))))
+        self.history_path.setText(settings.value("history_path", "", type=str) or str(default_history_path()))
+
+    def _load_history(self):
+        try:
+            self.history = DownloadHistory(self.history_path.text())
+        except (OSError, ValueError) as exc:
+            self.history = None
+            message = str(exc)
+            QTimer.singleShot(0, lambda: QMessageBox.warning(self, "อ่านประวัติไม่สำเร็จ", message + "\nเลือกที่เก็บ log ใหม่ได้ในตั้งค่าดาวน์โหลด"))
+
+    def pick_history_path(self):
+        destination, _ = QFileDialog.getSaveFileName(self, "เลือกที่บันทึกประวัติ (ย้ายประวัติเดิมไปด้วย)",
+                                                    self.history_path.text(), "History log (*.jsonl)")
+        if not destination:
+            return
+        try:
+            if self.history is not None:
+                self.history.move(destination)
+            else:
+                self.history = DownloadHistory(destination)
+            self.history_path.setText(str(self.history.path))
+            self._save_settings()
+            for row in range(len(self.items)):
+                self.refresh_row(row)
+            self._sync_actions()
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "เปลี่ยนที่เก็บประวัติไม่สำเร็จ", str(exc))
+
+    def clear_history(self):
+        if self.history is None or self.is_busy():
+            return
+        if QMessageBox.question(self, "ล้างประวัติ", "ล้างประวัติดาวน์โหลดทั้งหมดหรือไม่?\nไฟล์เพลงและวิดีโอที่ดาวน์โหลดไว้จะยังอยู่",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.history.clear()
+            for row in range(len(self.items)):
+                self.refresh_row(row)
+            self.footer.setText("ล้างประวัติดาวน์โหลดแล้ว")
+        except OSError as exc:
+            QMessageBox.warning(self, "ล้างประวัติไม่สำเร็จ", str(exc))
+
+    def _save_settings(self):
+        settings = QSettings(APP_NAME, APP_NAME)
+        for key, value in {
+            "format": self.format.currentText(),
+            "quality": self.quality.currentText(),
+            "folder": self.folder.text(),
+            "tags": self.chk_tags.isChecked(),
+            "cover": self.chk_cover.isChecked(),
+            "volume": self.volume.value(),
+            "history_path": "" if Path(self.history_path.text()).resolve() == default_history_path().resolve() else self.history_path.text(),
+        }.items():
+            settings.setValue(key, value)
+        settings.sync()
+
     def closeEvent(self, event):
         busy = (self.is_busy() or (self.preview_worker and self.preview_worker.isRunning()))
         if busy:
@@ -1080,6 +1217,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "กำลังปิดโปรแกรม", "มีการดาวน์โหลดหรือตรวจสอบที่กำลังทำงาน\nให้การทำงานปัจจุบันสิ้นสุดก่อน แล้วจึงปิดโปรแกรมอีกครั้ง")
             event.ignore()
             return
+        self._save_settings()
         self.player.stop()
         self.tempdir.cleanup()
         super().closeEvent(event)
